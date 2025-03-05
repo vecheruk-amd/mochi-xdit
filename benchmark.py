@@ -17,6 +17,7 @@ from genmo.mochi_preview.pipelines import (
     T5ModelFactory,
     linear_quadratic_schedule,
 )
+from rpd_handler import *
 
 pipeline = None
 model_dir_path = None
@@ -79,17 +80,12 @@ def generate_video(
     use_fsdp, t5_model_path, max_t5_token_length,
     use_xdit, ulysses_degree, ring_degree, cfg_parallel
 ):
+    # Load the model
     load_model(use_fsdp, t5_model_path, max_t5_token_length,
         use_xdit, ulysses_degree, ring_degree, cfg_parallel)
 
-    # sigma_schedule should be a list of floats of length (num_inference_steps + 1),
-    # such that sigma_schedule[0] == 1.0 and sigma_schedule[-1] == 0.0 and monotonically decreasing.
+    # Generate schedules
     sigma_schedule = linear_quadratic_schedule(num_inference_steps, 0.025)
-
-    # cfg_schedule should be a list of floats of length num_inference_steps.
-    # For simplicity, we just use the same cfg scale at all timesteps,
-    # but more optimal schedules may use varying cfg, e.g:
-    # [5.0] * (num_inference_steps // 2) + [4.5] * (num_inference_steps // 2)
     cfg_schedule = [cfg_scale] * num_inference_steps
 
     args = {
@@ -99,31 +95,22 @@ def generate_video(
         "sigma_schedule": sigma_schedule,
         "cfg_schedule": cfg_schedule,
         "num_inference_steps": num_inference_steps,
-        # We *need* flash attention to batch cfg
-        # and it's only worth doing in a high-memory regime (assume multiple GPUs)
         "batch_cfg": False,
         "prompt": prompt,
         "negative_prompt": negative_prompt,
         "seed": seed,
     }
 
+    # Run the pipeline, but do not save output
     with progress_bar(type="tqdm"):
-        final_frames = pipeline(**args)
+        final_frames = pipeline(**args)  # Compute-only, no file writing
 
+        # Ensure valid output
         final_frames = final_frames[0]
-
         assert isinstance(final_frames, np.ndarray)
         assert final_frames.dtype == np.float32
 
-        os.makedirs("outputs", exist_ok=True)
-        output_path = os.path.join("outputs", f"output_{int(time.time())}.mp4")
-
-
-        save_video(final_frames, output_path)
-        json_path = os.path.splitext(output_path)[0] + ".json"
-        json.dump(args, open(json_path, "w"), indent=4)
-
-        return output_path
+    return None
 
 from textwrap import dedent
 
@@ -155,14 +142,19 @@ inviting atmosphere.
 @click.option("--use_fsdp", is_flag=True, help="Whether to use FSDP")
 @click.option("--t5_model_path", default="google/t5-v1_1-xxl", type=str, help="the path of t5 model")
 @click.option("--max_t5_token_length", default=256, type=int, help="the max token length of t5")
+@click.option("--profile",  is_flag=True, help="enable profile")
 def generate_cli(
     prompt, negative_prompt, width, height, num_frames, seed, 
     cfg_scale, num_steps, model_dir, cpu_offload, 
     use_xdit, ulysses_degree, ring_degree, cfg_parallel, 
-    use_fsdp, t5_model_path, max_t5_token_length   
+    use_fsdp, t5_model_path, max_t5_token_length, profile   
 ):
+    # Configure model
     configure_model(model_dir, cpu_offload, torch.bfloat16)
-    output = generate_video(
+
+    # Warm-up (run once to load everything into memory)
+    print("Running warm-up iteration...")
+    generate_video(
         prompt,
         negative_prompt,
         width,
@@ -174,8 +166,62 @@ def generate_cli(
         use_fsdp, t5_model_path, max_t5_token_length,
         use_xdit, ulysses_degree, ring_degree, cfg_parallel
     )
-    click.echo(f"Video generated at: {output}")
+    torch.cuda.synchronize()  # Ensure GPU operations are complete
+    print("Warm-up done!")
+    torch_profiler = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            #on_trace_ready=torch.profiler.tensorboard_trace_handler('/app/models/log'),
+            record_shapes=True,
+            with_stack=True
+        )
+
+    # Run multiple iterations and record time
+    num_iters = 2
+    total_time = 0.0
+    for i in range(num_iters):
+        print(f"Starting iteration {i+1}/{num_iters}...")
+        if i == 1 and profile:
+            #profiler = HipTx()
+            #profiler.start_profiling()
+            torch_profiler.start()
+        start_time = time.time()
+
+        generate_video(
+            prompt,
+            negative_prompt,
+            width,
+            height,
+            num_frames,
+            seed,
+            cfg_scale,
+            num_steps,
+            use_fsdp, t5_model_path, max_t5_token_length,
+            use_xdit, ulysses_degree, ring_degree, cfg_parallel
+        )
+
+        torch.cuda.synchronize()  # Ensure all GPU work is finished
+
+        end_time = time.time()
+        if i == 1 and profile:
+            #profiler.stop_profiling()
+            torch_profiler.stop()
+            torch_profiler.export_chrome_trace(
+            f"MI300_multi_gpu.json"
+        )
+        iter_time = end_time - start_time
+        total_time += iter_time
+
+        print(f"Iteration {i+1} time: {iter_time:.2f} seconds")
+
+    # Compute average time
+    avg_time = total_time / num_iters
+    print(f"Average time over {num_iters} iterations: {avg_time:.2f} seconds")
+
 
 
 if __name__ == "__main__":
     generate_cli()
+
