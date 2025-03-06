@@ -626,11 +626,9 @@ class MochiMultiGPUPipeline:
         ulysses_degree,
         ring_degree,
         cfg_parallel,
-        profiling=False,
     ):
         ray.init()
         RemoteClass = ray.remote(MultiGPUContext)
-        self.profiling = profiling
         self.ctxs = [
             RemoteClass.options(num_gpus=1).remote(
                 text_encoder_factory=text_encoder_factory,
@@ -660,8 +658,8 @@ class MochiMultiGPUPipeline:
                 f"Max memory reserved: {torch.cuda.max_memory_reserved() / 1024**3:.2f} GB"
             )
             print_max_memory()
-            print(f"*******the profiling status is {self.profiling}*********")
-            if self.profiling:
+            print(f"*******the profiling status is {kwargs["profile"]}*********")
+            if kwargs["profile"]:
                 print(f"[Rank {ctx.local_rank}] Initializing profiler...")
                 ctx.profiler = torch.profiler.profile(
                     activities=[
@@ -670,7 +668,6 @@ class MochiMultiGPUPipeline:
                     ],
                     #on_trace_ready=torch.profiler.tensorboard_trace_handler('/app/models/log'),
                     record_shapes=True,
-                    with_stack=True
                 )  
                 ctx.profiler.start()
                 print(f"[Rank {ctx.local_rank}] Profiler started!")
@@ -692,7 +689,20 @@ class MochiMultiGPUPipeline:
             
             if ctx.local_rank == 0:
                 torch.save(latents, "latents.pt")
-                
+            print(f"*******the profiling status for decoder is {kwargs["profile_decode_only"]}*********")
+            if kwargs["profile_decode_only"]:
+                print(f"[Rank {ctx.local_rank}] Initializing decode profiler...")
+                ctx.profiler = torch.profiler.profile(
+                    activities=[
+                        torch.profiler.ProfilerActivity.CPU,
+                        torch.profiler.ProfilerActivity.CUDA,
+                    ],
+                    #on_trace_ready=torch.profiler.tensorboard_trace_handler('/app/models/log'),
+                    record_shapes=True,
+                    with_stack=True,
+                )  
+                ctx.profiler.start()
+                print(f"[Rank {ctx.local_rank}] Profiler started!")   
             with t("decoding"), progress_bar(type="ray_tqdm", enabled=ctx.local_rank == 0), torch.inference_mode():
                 frames = (
                     decode_latents_tiled_full(ctx.decoder, latents, **ctx.decode_args)
@@ -702,9 +712,18 @@ class MochiMultiGPUPipeline:
                     else decode_latents(ctx.decoder, latents)
                 )
                 print_max_memory()
-            if self.profiling:
+            if kwargs["profile"]:
                 torch.cuda.synchronize()
-                trace_filename = f"profiling_rank_{ctx.local_rank}.json"
+                trace_filename = f"/var/lib/jenkins/mochi-xdit/logs/profiling_rank_{ctx.local_rank}.json"
+                try:
+                    ctx.profiler.stop()
+                    ctx.profiler.export_chrome_trace(trace_filename)
+                    print(f"[Rank {ctx.local_rank}] Profiling saved to {trace_filename}")
+                except Exception as e:
+                    print(f"[Rank {ctx.local_rank}] Error while saving trace: {e}")
+            if kwargs["profile_decode_only"]:
+                torch.cuda.synchronize()
+                trace_filename = f"/var/lib/jenkins/mochi-xdit/decode_logs/profiling_rank_{ctx.local_rank}.json"
                 try:
                     ctx.profiler.stop()
                     ctx.profiler.export_chrome_trace(trace_filename)

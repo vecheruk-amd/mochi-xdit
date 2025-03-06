@@ -17,7 +17,7 @@ from genmo.mochi_preview.pipelines import (
     T5ModelFactory,
     linear_quadratic_schedule,
 )
-from rpd_handler import *
+#from rpd_handler import *
 
 pipeline = None
 model_dir_path = None
@@ -32,7 +32,7 @@ def configure_model(model_dir_path_, cpu_offload_, dtype_):
     dtype = dtype_
 
 def load_model(use_fsdp, t5_model_path, max_t5_token_length,
-        use_xdit, ulysses_degree, ring_degree, cfg_parallel, profiling):
+        use_xdit, ulysses_degree, ring_degree, cfg_parallel):
     global num_gpus, pipeline, model_dir_path
     if pipeline is None:
         MOCHI_DIR = model_dir_path
@@ -59,7 +59,6 @@ def load_model(use_fsdp, t5_model_path, max_t5_token_length,
             kwargs["ulysses_degree"] = ulysses_degree
             kwargs["ring_degree"] = ring_degree
             kwargs["cfg_parallel"] = cfg_parallel
-            kwargs["profiling"] = profiling
         else:
             kwargs["cpu_offload"] = cpu_offload
         kwargs["use_fsdp"] = use_fsdp
@@ -79,11 +78,13 @@ def generate_video(
     cfg_scale,
     num_inference_steps,
     use_fsdp, t5_model_path, max_t5_token_length,
-    use_xdit, ulysses_degree, ring_degree, cfg_parallel, is_profile
+    use_xdit, ulysses_degree, ring_degree, cfg_parallel, is_profile, is_profile_decode
 ):
     # Load the model
+    print(f"*********profile status is {is_profile}*********")
+    print(f"*********decode profile status is {is_profile_decode}*********")
     load_model(use_fsdp, t5_model_path, max_t5_token_length,
-        use_xdit, ulysses_degree, ring_degree, cfg_parallel, is_profile)
+        use_xdit, ulysses_degree, ring_degree, cfg_parallel)
 
     # Generate schedules
     sigma_schedule = linear_quadratic_schedule(num_inference_steps, 0.025)
@@ -100,6 +101,8 @@ def generate_video(
         "prompt": prompt,
         "negative_prompt": negative_prompt,
         "seed": seed,
+        "profile": is_profile,
+        "profile_decode_only": is_profile_decode
     }
 
     # Run the pipeline, but do not save output
@@ -144,17 +147,19 @@ inviting atmosphere.
 @click.option("--t5_model_path", default="google/t5-v1_1-xxl", type=str, help="the path of t5 model")
 @click.option("--max_t5_token_length", default=256, type=int, help="the max token length of t5")
 @click.option("--profile",  is_flag=True, help="enable profile")
+@click.option("--profile_decode_only",  is_flag=True, help="enable decode profile only")
 def generate_cli(
     prompt, negative_prompt, width, height, num_frames, seed, 
     cfg_scale, num_steps, model_dir, cpu_offload, 
     use_xdit, ulysses_degree, ring_degree, cfg_parallel, 
-    use_fsdp, t5_model_path, max_t5_token_length, profile   
+    use_fsdp, t5_model_path, max_t5_token_length, profile, profile_decode_only   
 ):
     # Configure model
     configure_model(model_dir, cpu_offload, torch.bfloat16)
 
     # Warm-up (run once to load everything into memory)
-    is_profile = True
+    is_profile = False
+    is_profile_decode = False
     print("Running warm-up iteration...")
     generate_video(
         prompt,
@@ -166,7 +171,7 @@ def generate_cli(
         cfg_scale,
         num_steps,
         use_fsdp, t5_model_path, max_t5_token_length,
-        use_xdit, ulysses_degree, ring_degree, cfg_parallel, is_profile
+        use_xdit, ulysses_degree, ring_degree, cfg_parallel, is_profile, is_profile_decode
     )
     torch.cuda.synchronize()  # Ensure GPU operations are complete
     print("Warm-up done!")
@@ -181,7 +186,7 @@ def generate_cli(
         )
 
     # Run multiple iterations and record time
-    num_iters = 2
+    num_iters = 5
     total_time = 0.0
     
 
@@ -192,8 +197,11 @@ def generate_cli(
             #profiler.start_profiling()
             is_profile = True
             #torch_profiler.start()
+        if i == 1 and profile_decode_only:
+            is_profile = False
+            is_profile_decode = True
         start_time = time.time()
-
+        print(f"********profiling status for iteration {i+1} is {is_profile}********")
         generate_video(
             prompt,
             negative_prompt,
@@ -204,7 +212,7 @@ def generate_cli(
             cfg_scale,
             num_steps,
             use_fsdp, t5_model_path, max_t5_token_length,
-            use_xdit, ulysses_degree, ring_degree, cfg_parallel, is_profile
+            use_xdit, ulysses_degree, ring_degree, cfg_parallel, is_profile, is_profile_decode
         )
 
         torch.cuda.synchronize()  # Ensure all GPU work is finished
@@ -217,6 +225,8 @@ def generate_cli(
             #torch_profiler.export_chrome_trace(
             #f"MI300_multi_gpu.json"
            # )
+        if i == 1 and profile_decode_only:
+            is_profile_decode = False
         iter_time = end_time - start_time
         total_time += iter_time
 
@@ -230,4 +240,3 @@ def generate_cli(
 
 if __name__ == "__main__":
     generate_cli()
-
