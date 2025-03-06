@@ -32,7 +32,7 @@ def configure_model(model_dir_path_, cpu_offload_, dtype_):
     dtype = dtype_
 
 def load_model(use_fsdp, t5_model_path, max_t5_token_length,
-        use_xdit, ulysses_degree, ring_degree, cfg_parallel):
+        use_xdit, ulysses_degree, ring_degree, cfg_parallel, profiling):
     global num_gpus, pipeline, model_dir_path
     if pipeline is None:
         MOCHI_DIR = model_dir_path
@@ -59,6 +59,7 @@ def load_model(use_fsdp, t5_model_path, max_t5_token_length,
             kwargs["ulysses_degree"] = ulysses_degree
             kwargs["ring_degree"] = ring_degree
             kwargs["cfg_parallel"] = cfg_parallel
+            kwargs["profiling"] = profiling
         else:
             kwargs["cpu_offload"] = cpu_offload
         kwargs["use_fsdp"] = use_fsdp
@@ -78,11 +79,11 @@ def generate_video(
     cfg_scale,
     num_inference_steps,
     use_fsdp, t5_model_path, max_t5_token_length,
-    use_xdit, ulysses_degree, ring_degree, cfg_parallel
+    use_xdit, ulysses_degree, ring_degree, cfg_parallel, is_profile
 ):
     # Load the model
     load_model(use_fsdp, t5_model_path, max_t5_token_length,
-        use_xdit, ulysses_degree, ring_degree, cfg_parallel)
+        use_xdit, ulysses_degree, ring_degree, cfg_parallel, is_profile)
 
     # Generate schedules
     sigma_schedule = linear_quadratic_schedule(num_inference_steps, 0.025)
@@ -153,6 +154,7 @@ def generate_cli(
     configure_model(model_dir, cpu_offload, torch.bfloat16)
 
     # Warm-up (run once to load everything into memory)
+    is_profile = True
     print("Running warm-up iteration...")
     generate_video(
         prompt,
@@ -164,7 +166,7 @@ def generate_cli(
         cfg_scale,
         num_steps,
         use_fsdp, t5_model_path, max_t5_token_length,
-        use_xdit, ulysses_degree, ring_degree, cfg_parallel
+        use_xdit, ulysses_degree, ring_degree, cfg_parallel, is_profile
     )
     torch.cuda.synchronize()  # Ensure GPU operations are complete
     print("Warm-up done!")
@@ -181,12 +183,15 @@ def generate_cli(
     # Run multiple iterations and record time
     num_iters = 2
     total_time = 0.0
+    
+
     for i in range(num_iters):
         print(f"Starting iteration {i+1}/{num_iters}...")
         if i == 1 and profile:
             #profiler = HipTx()
             #profiler.start_profiling()
-            torch_profiler.start()
+            is_profile = True
+            #torch_profiler.start()
         start_time = time.time()
 
         generate_video(
@@ -199,7 +204,7 @@ def generate_cli(
             cfg_scale,
             num_steps,
             use_fsdp, t5_model_path, max_t5_token_length,
-            use_xdit, ulysses_degree, ring_degree, cfg_parallel
+            use_xdit, ulysses_degree, ring_degree, cfg_parallel, is_profile
         )
 
         torch.cuda.synchronize()  # Ensure all GPU work is finished
@@ -207,10 +212,11 @@ def generate_cli(
         end_time = time.time()
         if i == 1 and profile:
             #profiler.stop_profiling()
-            torch_profiler.stop()
-            torch_profiler.export_chrome_trace(
-            f"MI300_multi_gpu.json"
-        )
+            is_profile = False
+            #torch_profiler.stop()
+            #torch_profiler.export_chrome_trace(
+            #f"MI300_multi_gpu.json"
+           # )
         iter_time = end_time - start_time
         total_time += iter_time
 

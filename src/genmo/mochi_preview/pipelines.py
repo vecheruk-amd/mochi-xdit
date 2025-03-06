@@ -626,9 +626,11 @@ class MochiMultiGPUPipeline:
         ulysses_degree,
         ring_degree,
         cfg_parallel,
+        profiling=False,
     ):
         ray.init()
         RemoteClass = ray.remote(MultiGPUContext)
+        self.profiling = profiling
         self.ctxs = [
             RemoteClass.options(num_gpus=1).remote(
                 text_encoder_factory=text_encoder_factory,
@@ -658,7 +660,20 @@ class MochiMultiGPUPipeline:
                 f"Max memory reserved: {torch.cuda.max_memory_reserved() / 1024**3:.2f} GB"
             )
             print_max_memory()
-            
+            print(f"*******the profiling status is {self.profiling}*********")
+            if self.profiling:
+                print(f"[Rank {ctx.local_rank}] Initializing profiler...")
+                ctx.profiler = torch.profiler.profile(
+                    activities=[
+                        torch.profiler.ProfilerActivity.CPU,
+                        torch.profiler.ProfilerActivity.CUDA,
+                    ],
+                    #on_trace_ready=torch.profiler.tensorboard_trace_handler('/app/models/log'),
+                    record_shapes=True,
+                    with_stack=True
+                )  
+                ctx.profiler.start()
+                print(f"[Rank {ctx.local_rank}] Profiler started!")
             t = Timer()
             with t("conditioning"), progress_bar(type="ray_tqdm", enabled=ctx.local_rank == 0), torch.inference_mode():
                 conditioning = get_conditioning(
@@ -687,7 +702,15 @@ class MochiMultiGPUPipeline:
                     else decode_latents(ctx.decoder, latents)
                 )
                 print_max_memory()
-            
+            if self.profiling:
+                torch.cuda.synchronize()
+                trace_filename = f"profiling_rank_{ctx.local_rank}.json"
+                try:
+                    ctx.profiler.stop()
+                    ctx.profiler.export_chrome_trace(trace_filename)
+                    print(f"[Rank {ctx.local_rank}] Profiling saved to {trace_filename}")
+                except Exception as e:
+                    print(f"[Rank {ctx.local_rank}] Error while saving trace: {e}")
             if ctx.local_rank == 0:
                 t.print_stats()
                 
